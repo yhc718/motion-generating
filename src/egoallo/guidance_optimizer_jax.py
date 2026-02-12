@@ -40,11 +40,32 @@ def do_guidance_optimization(
     hamer_detections: None | CorrespondedHamerDetections,
     aria_detections: None | CorrespondedAriaHandWristPoseDetections,
     verbose: bool,
+    use_predicted_root: bool = False,
 ) -> tuple[network.EgoDenoiseTraj, dict]:
-    """Run an optimizer to apply foot contact constraints."""
+    """Run an optimizer to apply foot contact constraints.
+
+    Args:
+        use_predicted_root: If True, use traj.root_orient and traj.root_trans
+            to compute Ts_world_root for FK instead of deriving root from
+            Ts_world_cpf. This is important when Ts_world_cpf is a dummy
+            trajectory (e.g. wrist-conditioning mode without Aria head tracking).
+    """
 
     assert traj.hand_rotmats is not None
     guidance_params = JaxGuidanceParams.defaults(guidance_mode, phase)
+
+    # Compute Ts_world_root from predicted root_orient + root_trans.
+    Ts_world_root_jax = None
+    if use_predicted_root:
+        root_quats = SO3.from_matrix(
+            traj.root_orient  # (*batch, T, 3, 3)
+        ).wxyz  # (*batch, T, 4)
+        Ts_world_root_torch = torch.cat(
+            [root_quats, traj.root_trans], dim=-1
+        )  # (*batch, T, 7)
+        Ts_world_root_jax = cast(
+            jax.Array, Ts_world_root_torch.numpy(force=True)
+        )
 
     start_time = time.time()
     quats, debug_info = _optimize_vmapped(
@@ -72,6 +93,7 @@ def do_guidance_optimization(
         if aria_detections is None
         else aria_detections.as_nested_dict(numpy=True),
         verbose=verbose,
+        Ts_world_root=Ts_world_root_jax,
     )
     rotmats = SO3(
         torch.from_numpy(onp.array(quats))
@@ -125,7 +147,20 @@ def _optimize_vmapped(
     hamer_detections: dict | None,
     aria_detections: dict | None,
     verbose: jdc.Static[bool],
+    Ts_world_root: jax.Array | None = None,
 ) -> tuple[jax.Array, dict]:
+    # Ts_world_root has a batch dim (num_samples, timesteps, 7) when provided,
+    # so it must be vmapped over (like betas, body_rotmats, etc.), NOT passed
+    # via partial which would treat it as shared across samples.
+    vmapped_kwargs: dict[str, jax.Array] = dict(
+        betas=betas,
+        body_rotmats=body_rotmats,
+        hand_rotmats=hand_rotmats,
+        contacts=contacts,
+    )
+    if Ts_world_root is not None:
+        vmapped_kwargs["Ts_world_root"] = Ts_world_root
+
     return jax.vmap(
         partial(
             _optimize,
@@ -135,12 +170,10 @@ def _optimize_vmapped(
             hamer_detections=hamer_detections,
             aria_detections=aria_detections,
             verbose=verbose,
+            **({"Ts_world_root": None} if Ts_world_root is None else {}),
         )
     )(
-        betas=betas,
-        body_rotmats=body_rotmats,
-        hand_rotmats=hand_rotmats,
-        contacts=contacts,
+        **vmapped_kwargs,
     )
 
 
@@ -311,15 +344,25 @@ def _optimize(
     hamer_detections: dict | None,
     aria_detections: dict | None,
     verbose: bool,
+    Ts_world_root: jax.Array | None = None,
 ) -> tuple[jax.Array, dict]:
     """Apply constraints using Levenberg-Marquardt optimizer. Returns updated
-    body_rotmats and hand_rotmats matrices."""
+    body_rotmats and hand_rotmats matrices.
+
+    Args:
+        Ts_world_root: If provided (timesteps, 7) wxyz_xyz, use these directly
+            as root transforms for FK instead of deriving from Ts_world_cpf.
+    """
     timesteps = body_rotmats.shape[0]
     assert Ts_world_cpf.shape == (timesteps, 7)
     assert body_rotmats.shape == (timesteps, 21, 3, 3)
     assert hand_rotmats.shape == (timesteps, 30, 3, 3)
     assert contacts.shape == (timesteps, 21)
     assert betas.shape == (timesteps, 16)
+
+    _use_predicted_root = Ts_world_root is not None
+    if _use_predicted_root:
+        assert Ts_world_root.shape == (timesteps, 7)
 
     init_quats = jaxlie.SO3.from_matrix(
         # body_rotmats
@@ -336,13 +379,18 @@ def _optimize(
     init_posed = shaped_body.with_pose(
         jaxlie.SE3.identity(batch_axes=(timesteps,)).wxyz_xyz, init_quats
     )
-    T_world_head = jaxlie.SE3(Ts_world_cpf) @ jaxlie.SE3(T_cpf_head)
-    T_root_head = jaxlie.SE3(init_posed.Ts_world_joint[:, 14])
-    init_posed = init_posed.with_new_T_world_root(
-        (T_world_head @ T_root_head.inverse()).wxyz_xyz
-    )
-    del T_world_head
-    del T_root_head
+    if _use_predicted_root:
+        # Use the model-predicted root transforms directly.
+        init_posed = init_posed.with_new_T_world_root(Ts_world_root)
+    else:
+        # Original: derive root from CPF head tracking.
+        T_world_head = jaxlie.SE3(Ts_world_cpf) @ jaxlie.SE3(T_cpf_head)
+        T_root_head = jaxlie.SE3(init_posed.Ts_world_joint[:, 14])
+        init_posed = init_posed.with_new_T_world_root(
+            (T_world_head @ T_root_head.inverse()).wxyz_xyz
+        )
+        del T_world_head
+        del T_root_head
 
     foot_joint_indices = jnp.array([6, 7, 9, 10])
     num_foot_joints = foot_joint_indices.shape[0]
@@ -401,15 +449,20 @@ def _optimize(
             assert False
 
         if output_frame == "world":
-            T_world_root = (
-                # T_world_cpf
-                jaxlie.SE3(Ts_world_cpf[var.id, :])
-                # T_cpf_head
-                @ jaxlie.SE3(T_cpf_head)
-                # T_head_root
-                @ jaxlie.SE3(posed.Ts_world_joint[14]).inverse()
-            )
-            return posed.with_new_T_world_root(T_world_root.wxyz_xyz)
+            if _use_predicted_root:
+                # Use model-predicted root transform directly.
+                return posed.with_new_T_world_root(Ts_world_root[var.id, :])
+            else:
+                # Original: derive root from CPF head tracking.
+                T_world_root = (
+                    # T_world_cpf
+                    jaxlie.SE3(Ts_world_cpf[var.id, :])
+                    # T_cpf_head
+                    @ jaxlie.SE3(T_cpf_head)
+                    # T_head_root
+                    @ jaxlie.SE3(posed.Ts_world_joint[14]).inverse()
+                )
+                return posed.with_new_T_world_root(T_world_root.wxyz_xyz)
         elif output_frame == "root":
             return posed
 

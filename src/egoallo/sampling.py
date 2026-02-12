@@ -68,7 +68,10 @@ def run_sampling_with_stitching(
     aria_detections: None | CorrespondedAriaHandWristPoseDetections,
     num_samples: int,
     device: torch.device,
+    object_sdf_data: dict | None = None,
     guidance_verbose: bool = True,
+    wrist_positions: Float[Tensor, "time 14"] | None = None,
+    use_predicted_root: bool = False,
 ) -> network.EgoDenoiseTraj:
     # Offset the T_world_cpf transform to place the floor at z=0 for the
     # denoiser network. All of the network outputs are local, so we don't need to
@@ -150,6 +153,9 @@ def run_sampling_with_stitching(
                         ].repeat((num_samples, 1, 1)),
                         project_output_rotmats=False,
                         hand_positions_wrt_cpf=None,  # TODO: this should be filled in!!
+                        wrist_positions=wrist_positions[None, start_t:end_t, :].repeat(
+                            (num_samples, 1, 1)
+                        ) if wrist_positions is not None else None,
                         mask=None,
                     )
                     * overlap_weights_slice
@@ -188,7 +194,9 @@ def run_sampling_with_stitching(
                 phase="inner",
                 hamer_detections=hamer_detections,
                 aria_detections=aria_detections,
+                #object_sdf_data=object_sdf_data,
                 verbose=guidance_verbose,
+                use_predicted_root=use_predicted_root,
             )
             x_0_packed_pred = x_0_pred.pack()
             del x_0_pred
@@ -223,7 +231,9 @@ def run_sampling_with_stitching(
             phase="post",
             hamer_detections=hamer_detections,
             aria_detections=aria_detections,
+            #object_sdf_data=object_sdf_data,
             verbose=guidance_verbose,
+            use_predicted_root=use_predicted_root,
         )
         assert start_time is not None
         print("RUNTIME (exclude first optimization)", time.time() - start_time)

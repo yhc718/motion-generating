@@ -140,6 +140,7 @@ def visualize_traj_and_hand_detections(
     floor_z: float = 0.0,
     show_joints: bool = False,
     get_ego_video: Callable[[int, int, float], bytes] | None = None,
+    Ts_world_root: Float[Tensor, "num_samples timesteps 7"] | None = None,
 ) -> Callable[[], int]:
     """Chaotic mega-function for visualization. Returns a callback that should
     be called repeatedly in a loop."""
@@ -204,12 +205,18 @@ def visualize_traj_and_hand_detections(
         )
 
         assert Ts_world_cpf.shape == (timesteps, 7)
-        T_world_root = fncsmpl_extensions.get_T_world_root_from_cpf_pose(
-            # Batch axes of fk_outputs are (num_samples, time).
-            # Batch axes of Ts_world_cpf are (time,).
-            fk_outputs,
-            Ts_world_cpf[None, ...],
-        )
+        if Ts_world_root is not None:
+            # Use provided Ts_world_root (for simulator mode)
+            T_world_root = Ts_world_root
+            print(f"Using provided Ts_world_root with shape {T_world_root.shape}")
+        else:
+            # Compute from Ts_world_cpf (for Aria mode)
+            T_world_root = fncsmpl_extensions.get_T_world_root_from_cpf_pose(
+                # Batch axes of fk_outputs are (num_samples, time).
+                # Batch axes of Ts_world_cpf are (time,).
+                fk_outputs,
+                Ts_world_cpf[None, ...],
+            )
         fk_outputs = fk_outputs.with_new_T_world_root(T_world_root)
     else:
         shaped = None

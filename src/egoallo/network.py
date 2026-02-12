@@ -39,12 +39,18 @@ class EgoDenoiseTraj(TensorDataclass):
     contacts: Float[Tensor, "*#batch timesteps 21"]
     """Contact boolean for each joint."""
 
+    root_trans: Float[Tensor, "*#batch timesteps 3"]
+    """Root translation in world frame."""
+
+    root_orient: Float[Tensor, "*#batch timesteps 3 3"]
+    """Root orientation as rotation matrix in world frame."""
+
     hand_rotmats: Float[Tensor, "*#batch timesteps 30 3 3"] | None
-    """Local orientations for each body joint."""
+    """Local orientations for each hand joint."""
 
     @staticmethod
     def get_packed_dim(include_hands: bool) -> int:
-        packed_dim = 16 + 21 * 9 + 21
+        packed_dim = 16 + 21 * 9 + 21 + 3 + 9  # betas + body_rotmats + contacts + root_trans + root_orient
         if include_hands:
             packed_dim += 30 * 9
         return packed_dim
@@ -54,8 +60,11 @@ class EgoDenoiseTraj(TensorDataclass):
         dtype = self.betas.dtype
         assert self.hand_rotmats is not None
         shaped = body_model.with_shape(self.betas)
+        # Use predicted root orientation and translation
+        root_quat = SO3.from_matrix(self.root_orient).wxyz
+        T_world_root = torch.cat([root_quat, self.root_trans], dim=-1)
         posed = shaped.with_pose(
-            T_world_root=SE3.identity(device=device, dtype=dtype).parameters(),
+            T_world_root=T_world_root,
             local_quats=SO3.from_matrix(
                 torch.cat([self.body_rotmats, self.hand_rotmats], dim=-3)
             ).wxyz,
@@ -92,28 +101,33 @@ class EgoDenoiseTraj(TensorDataclass):
         assert d_state == cls.get_packed_dim(include_hands)
 
         if include_hands:
-            betas, body_rotmats_flat, contacts, hand_rotmats_flat = torch.split(
-                x, [16, 21 * 9, 21, 30 * 9], dim=-1
+            betas, body_rotmats_flat, contacts, root_trans, root_orient_flat, hand_rotmats_flat = torch.split(
+                x, [16, 21 * 9, 21, 3, 9, 30 * 9], dim=-1
             )
             body_rotmats = body_rotmats_flat.reshape((*batch, time, 21, 3, 3))
             hand_rotmats = hand_rotmats_flat.reshape((*batch, time, 30, 3, 3))
+            root_orient = root_orient_flat.reshape((*batch, time, 3, 3))
             assert betas.shape == (*batch, time, 16)
         else:
-            betas, body_rotmats_flat, contacts = torch.split(
-                x, [16, 21 * 9, 21], dim=-1
+            betas, body_rotmats_flat, contacts, root_trans, root_orient_flat = torch.split(
+                x, [16, 21 * 9, 21, 3, 9], dim=-1
             )
             body_rotmats = body_rotmats_flat.reshape((*batch, time, 21, 3, 3))
             hand_rotmats = None
+            root_orient = root_orient_flat.reshape((*batch, time, 3, 3))
             assert betas.shape == (*batch, time, 16)
 
         if project_rotmats:
             # We might want to handle the -1 determinant case as well.
             body_rotmats = project_rotmats_via_svd(body_rotmats)
+            root_orient = project_rotmats_via_svd(root_orient)
 
         return EgoDenoiseTraj(
             betas=betas,
             body_rotmats=body_rotmats,
             contacts=contacts,
+            root_trans=root_trans,
+            root_orient=root_orient,
             hand_rotmats=hand_rotmats,
         )
 
@@ -130,6 +144,9 @@ class EgoDenoiserConfig:
     decoder_layers: int = 6
     dropout_p: float = 0.0
     activation: Literal["gelu", "relu"] = "gelu"
+    use_slam_conditioning: bool = False
+    use_wrist_conditioning: bool = True
+    """Whether to use wrist positions as conditioning instead of CPF poses."""
 
     positional_encoding: Literal["transformer", "rope"] = "rope"
     noise_conditioning: Literal["token", "film"] = "token"
@@ -162,6 +179,19 @@ class EgoDenoiserConfig:
     def d_cond(self) -> int:
         """Dimensionality of conditioning vector."""
 
+        if not self.use_slam_conditioning and not self.use_wrist_conditioning:
+            return 0
+        
+        if self.use_wrist_conditioning:
+            # Two wrist positions (left and right, each 3D) + quaternion orientations (each 4D)
+            # Total: 3 + 3 + 4 + 4 = 14
+            d_cond = 14
+            d_cond = d_cond + d_cond * self.fourier_enc_freqs * 2  # Fourier encoding
+            return d_cond
+        
+        # Original SLAM conditioning code below
+        if not self.use_slam_conditioning:
+            return 0
         if self.cond_param == "ours":
             d_cond = 0
             d_cond += 12  # Relative CPF pose, flattened 3x4 matrix.
@@ -191,12 +221,28 @@ class EgoDenoiserConfig:
 
     def make_cond(
         self,
-        T_cpf_tm1_cpf_t: Float[Tensor, "batch time 7"],
-        T_world_cpf: Float[Tensor, "batch time 7"],
+        T_cpf_tm1_cpf_t: Float[Tensor, "batch time 7"] | None,
+        T_world_cpf: Float[Tensor, "batch time 7"] | None,
         hand_positions_wrt_cpf: Float[Tensor, "batch time 6"] | None,
-    ) -> Float[Tensor, "batch time d_cond"]:
-        """Construct conditioning information from CPF pose."""
+        wrist_positions: Float[Tensor, "batch time 14"] | None = None,
+    ) -> Float[Tensor, "batch time d_cond"] | None:
+        """Construct conditioning information from CPF pose or wrist positions."""
 
+        # Use wrist positions as conditioning if enabled
+        if self.use_wrist_conditioning:
+            if wrist_positions is None:
+                raise ValueError("wrist_positions must be provided when use_wrist_conditioning=True")
+            (batch, time, _) = wrist_positions.shape
+            assert wrist_positions.shape == (batch, time, 14)
+            cond = fourier_encode(wrist_positions, freqs=self.fourier_enc_freqs)
+            assert cond.shape == (batch, time, self.d_cond)
+            return cond
+
+        # Return None if SLAM conditioning is disabled
+        if not self.use_slam_conditioning:
+            return None
+
+        assert T_cpf_tm1_cpf_t is not None and T_world_cpf is not None
         (batch, time, _) = T_cpf_tm1_cpf_t.shape
 
         # Construct device pose conditioning.
@@ -324,6 +370,8 @@ class EgoDenoiser(nn.Module):
             "betas": 16,
             "body_rotmats": 21 * 9,
             "contacts": 21,
+            "root_trans": 3,
+            "root_orient": 9,
         }
         if config.include_hands:
             modality_dims["hand_rotmats"] = 30 * 9
@@ -356,7 +404,12 @@ class EgoDenoiser(nn.Module):
         )
 
         # Helpers for converting between input dimensionality and latent dimensionality.
-        self.latent_from_cond = nn.Linear(config.d_cond, config.d_latent)
+        # Create when SLAM or wrist conditioning is enabled
+        self.latent_from_cond = (
+            nn.Linear(config.d_cond, config.d_latent)
+            if (config.use_slam_conditioning or config.use_wrist_conditioning)
+            else None
+        )
 
         # Noise embedder.
         self.noise_emb = nn.Embedding(
@@ -403,7 +456,8 @@ class EgoDenoiser(nn.Module):
                         n_heads=config.num_heads,
                         dropout_p=config.dropout_p,
                         activation=config.activation,
-                        include_xattn=True,  # Include conditioning for the decoder.
+                        # Include cross-attention when SLAM or wrist conditioning is enabled.
+                        include_xattn=(config.use_slam_conditioning or config.use_wrist_conditioning),
                         use_rope_embedding=config.positional_encoding == "rope",
                         use_film_noise_conditioning=config.noise_conditioning == "film",
                         xattn_mode=config.xattn_mode,
@@ -421,13 +475,15 @@ class EgoDenoiser(nn.Module):
         x_t_packed: Float[Tensor, "batch time state_dim"],
         t: Float[Tensor, "batch"],
         *,
-        T_world_cpf: Float[Tensor, "batch time 7"],
-        T_cpf_tm1_cpf_t: Float[Tensor, "batch time 7"],
+        T_world_cpf: Float[Tensor, "batch time 7"] | None = None,
+        T_cpf_tm1_cpf_t: Float[Tensor, "batch time 7"] | None = None,
         project_output_rotmats: bool,
         # Observed hand positions, relative to the CPF.
-        hand_positions_wrt_cpf: Float[Tensor, "batch time 6"] | None,
+        hand_positions_wrt_cpf: Float[Tensor, "batch time 6"] | None = None,
+        # Wrist positions for conditioning
+        wrist_positions: Float[Tensor, "batch time 14"] | None = None,
         # Attention mask for using shorter sequences.
-        mask: Bool[Tensor, "batch time"] | None,
+        mask: Bool[Tensor, "batch time"] | None = None,
         # Mask for when to drop out / keep conditioning information.
         cond_dropout_keep_mask: Bool[Tensor, "batch"] | None = None,
     ) -> Float[Tensor, "batch time state_dim"]:
@@ -444,6 +500,8 @@ class EgoDenoiser(nn.Module):
             self.encoders["betas"](x_t.betas.reshape((batch, time, -1)))
             + self.encoders["body_rotmats"](x_t.body_rotmats.reshape((batch, time, -1)))
             + self.encoders["contacts"](x_t.contacts)
+            + self.encoders["root_trans"](x_t.root_trans)
+            + self.encoders["root_orient"](x_t.root_orient.reshape((batch, time, -1)))
         )
         if self.config.include_hands:
             assert x_t.hand_rotmats is not None
@@ -462,11 +520,12 @@ class EgoDenoiser(nn.Module):
             T_cpf_tm1_cpf_t,
             T_world_cpf=T_world_cpf,
             hand_positions_wrt_cpf=hand_positions_wrt_cpf,
+            wrist_positions=wrist_positions,
         )
 
         # Randomly drop out conditioning information; this serves as a
         # regularizer that aims to improve sample diversity.
-        if cond_dropout_keep_mask is not None:
+        if cond is not None and cond_dropout_keep_mask is not None:
             assert cond_dropout_keep_mask.shape == (batch,)
             cond = cond * cond_dropout_keep_mask[:, None, None]
 
@@ -477,13 +536,17 @@ class EgoDenoiser(nn.Module):
             pos_enc = make_positional_encoding(
                 d_latent=config.d_latent,
                 length=time,
-                dtype=cond.dtype,
+                dtype=x_t_encoded.dtype,
             )[None, ...].to(x_t_encoded.device)
             assert pos_enc.shape == (1, time, config.d_latent)
         else:
             assert_never(config.positional_encoding)
 
-        encoder_out = self.latent_from_cond(cond) + pos_enc
+        # Only compute encoder output when SLAM conditioning is enabled
+        if cond is not None and self.latent_from_cond is not None:
+            encoder_out = self.latent_from_cond(cond) + pos_enc
+        else:
+            encoder_out = None
         decoder_out = x_t_encoded + pos_enc
 
         # Append the noise embedding to the encoder and decoder inputs.
@@ -491,13 +554,17 @@ class EgoDenoiser(nn.Module):
         if self.noise_emb_token_proj is not None:
             noise_emb_token = self.noise_emb_token_proj(noise_emb)
             assert noise_emb_token.shape == (batch, config.d_latent)
-            encoder_out = torch.cat([noise_emb_token[:, None, :], encoder_out], dim=1)
+            if encoder_out is not None:
+                encoder_out = torch.cat([noise_emb_token[:, None, :], encoder_out], dim=1)
             decoder_out = torch.cat([noise_emb_token[:, None, :], decoder_out], dim=1)
-            assert (
-                encoder_out.shape
-                == decoder_out.shape
-                == (batch, time + 1, config.d_latent)
-            )
+            if encoder_out is not None:
+                assert (
+                    encoder_out.shape
+                    == decoder_out.shape
+                    == (batch, time + 1, config.d_latent)
+                )
+            else:
+                assert decoder_out.shape == (batch, time + 1, config.d_latent)
             num_tokens = time + 1
         else:
             num_tokens = time
@@ -517,8 +584,10 @@ class EgoDenoiser(nn.Module):
             assert attn_mask.dtype == torch.bool
 
         # Forward pass through transformer.
-        for layer in self.encoder_layers:
-            encoder_out = layer(encoder_out, attn_mask, noise_emb=noise_emb)
+        # Only run encoder when SLAM conditioning is enabled
+        if encoder_out is not None:
+            for layer in self.encoder_layers:
+                encoder_out = layer(encoder_out, attn_mask, noise_emb=noise_emb)
         for layer in self.decoder_layers:
             decoder_out = layer(
                 decoder_out, attn_mask, noise_emb=noise_emb, cond=encoder_out
@@ -532,16 +601,16 @@ class EgoDenoiser(nn.Module):
 
         packed_output = torch.cat(
             [
-                # Project rotation matrices for body_rotmats via SVD,
+                # Project rotation matrices for body_rotmats, hand_rotmats, root_orient via SVD,
                 (
                     project_rotmats_via_svd(
                         modality_decoder(decoder_out).reshape((-1, 3, 3))
                     ).reshape(
-                        (batch, time, {"body_rotmats": 21, "hand_rotmats": 30}[key] * 9)
+                        (batch, time, {"body_rotmats": 21, "hand_rotmats": 30, "root_orient": 1}[key] * 9)
                     )
                     # if enabled,
                     if project_output_rotmats
-                    and key in ("body_rotmats", "hand_rotmats")
+                    and key in ("body_rotmats", "hand_rotmats", "root_orient")
                     # otherwise, just decode normally.
                     else modality_decoder(decoder_out)
                 )
