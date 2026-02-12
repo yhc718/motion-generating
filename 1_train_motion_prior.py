@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import tensorboardX
+import wandb
 import torch.optim.lr_scheduler
 import torch.utils.data
 import tyro
@@ -14,7 +15,7 @@ from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.utils import ProjectConfiguration
 from loguru import logger
 
-from egoallo import network, training_loss, training_utils
+from egoallo import fncsmpl, network, training_loss_with_wrist, training_utils
 from egoallo.data.amass import EgoAmassHdf5Dataset
 from egoallo.data.dataclass import collate_dataclass
 
@@ -26,7 +27,10 @@ class EgoAlloTrainConfig:
     dataset_files_path: Path
 
     model: network.EgoDenoiserConfig = network.EgoDenoiserConfig()
-    loss: training_loss.TrainingLossConfig = training_loss.TrainingLossConfig()
+    loss: training_loss_with_wrist.TrainingLossConfigWithWrist = training_loss_with_wrist.TrainingLossConfigWithWrist()
+    
+    # SMPL-H model path for FK-based wrist loss
+    smplh_npz_path: Path = Path("./data/smplh/neutral/model.npz")
 
     # Dataset arguments.
     batch_size: int = 256
@@ -42,6 +46,11 @@ class EgoAlloTrainConfig:
         "train",
         "val",
     )
+
+    # Wandb options.
+    use_wandb: bool = True
+    wandb_project: str = "egoallo-motion-prior"
+    wandb_entity: str | None = None
 
     # Optimizer options.
     learning_rate: float = 1e-4
@@ -83,6 +92,17 @@ def run_training(
         if accelerator.is_main_process
         else None
     )
+    
+    # Initialize wandb
+    if accelerator.is_main_process and config.use_wandb:
+        wandb.init(
+            project=config.wandb_project,
+            entity=config.wandb_entity,
+            name=config.experiment_name,
+            config=dataclasses.asdict(config),
+            dir=str(experiment_dir),
+        )
+    
     device = accelerator.device
 
     # Initialize experiment.
@@ -162,8 +182,13 @@ def run_training(
     # checkpoint vs the others.
     accelerator.save_state(str(experiment_dir / f"checkpoints_{step}"))
 
+    # Load body model for FK-based wrist loss
+    body_model = fncsmpl.SmplhModel.load(config.smplh_npz_path).to(device)
+    
     # Run training loop!
-    loss_helper = training_loss.TrainingLossComputer(config.loss, device=device)
+    loss_helper = training_loss_with_wrist.TrainingLossComputerWithWrist(
+        config.loss, device=device, body_model=body_model
+    )
     loop_metrics_gen = training_utils.loop_metric_generator(counter_init=step)
     prev_checkpoint_path: Path | None = None
     while True:
@@ -194,6 +219,10 @@ def run_training(
                 assert writer is not None
                 for k, v in log_outputs.items():
                     writer.add_scalar(k, v, step)
+                
+                # Log to wandb
+                if config.use_wandb:
+                    wandb.log(log_outputs, step=step)
 
             # Print status update to terminal.
             if step % 20 == 0:
