@@ -1,7 +1,9 @@
-"""Training loss configuration with wrist FK error.
+"""Training loss configuration with wrist FK error and right-hand coordinate frame.
 
-This is an extended version of training_loss.py that adds wrist position error
-computed via Forward Kinematics (FK).
+This is an extended version of training_loss.py that:
+1. Uses the condition's right hand as the coordinate system for root prediction.
+2. Adds wrist position error computed via Forward Kinematics (FK).
+3. Removes foot FK and skating losses.
 """
 
 import dataclasses
@@ -26,6 +28,13 @@ from .transforms import SE3, SO3
 WRIST_LEFT_IDX = 19
 WRIST_RIGHT_IDX = 20
 
+# Foot/ankle joint indices (0-indexed, excluding root)
+# These match the indices used in guidance_optimizer_jax.py for skating cost.
+# Joint 6 = left ankle, Joint 7 = left foot
+# Joint 9 = right ankle, Joint 10 = right foot
+FOOT_JOINT_INDICES = [6, 7, 9, 10]
+NUM_FOOT_JOINTS = len(FOOT_JOINT_INDICES)
+
 
 @dataclasses.dataclass(frozen=True)
 class TrainingLossConfigWithWrist:
@@ -36,14 +45,16 @@ class TrainingLossConfigWithWrist:
     loss_weights: dict[str, float] = dataclasses.field(
         default_factory={
             "betas": 0.1,
-            "body_rotmats": 1.0,
+            "body_rotmats": 3.0,
             "contacts": 0.1,
             # We don't have many hands in the AMASS dataset...
             "hand_rotmats": 0.01,
             "root_trans": 1.0,
             "root_orient": 1.0,
-            # Wrist FK error - higher weight as requested
-            "wrist_fk": 5.0,
+            # Wrist FK error (in world frame, after transforming root back from RH frame)
+            "wrist_fk": 3.0,
+            # Root translation velocity loss (per-frame displacement matching, in RH frame)
+            "root_vel": 1.0,
         }.copy
     )
     weight_loss_by_t: Literal["emulate_eps_pred"] = "emulate_eps_pred"
@@ -161,6 +172,65 @@ class TrainingLossComputerWithWrist:
             'orientations': wrist_orientations,
         }
 
+    def _compute_joint_positions_fk(
+        self,
+        betas: Float[Tensor, "batch time 16"],
+        body_rotmats: Float[Tensor, "batch time 21 3 3"],
+        root_trans: Float[Tensor, "batch time 3"],
+        root_orient: Float[Tensor, "batch time 3 3"],
+        joint_indices: list[int] | None = None,
+    ) -> Float[Tensor, "batch time J 3"]:
+        """Compute world-frame joint positions via FK for specified joints.
+
+        Args:
+            betas: Body shape parameters.
+            body_rotmats: Body joint rotation matrices (21 joints).
+            root_trans: Root translation in world frame.
+            root_orient: Root orientation as rotation matrix (3x3).
+            joint_indices: Which joints to extract. If None, returns all joints.
+
+        Returns:
+            World-frame positions of the requested joints, shape (batch, time, J, 3).
+        """
+        assert self.body_model is not None, "Body model required for FK computation"
+
+        batch, time, num_joints, _, _ = body_rotmats.shape
+        assert num_joints == 21
+
+        # Convert rotation matrices to quaternions
+        body_quats = SO3.from_matrix(body_rotmats).wxyz  # (batch, time, 21, 4)
+        root_quat = SO3.from_matrix(root_orient).wxyz  # (batch, time, 4)
+
+        # Flatten batch and time for FK computation
+        body_quats_flat = body_quats.reshape(batch * time, 21, 4)
+        root_trans_flat = root_trans.reshape(batch * time, 3)
+        root_quat_flat = root_quat.reshape(batch * time, 4)
+
+        # Construct T_world_root: (batch*time, 7) as wxyz_xyz
+        T_world_root = torch.cat([root_quat_flat, root_trans_flat], dim=-1)
+
+        # Apply shape
+        betas_expanded = betas[:, 0, :].unsqueeze(1).expand(batch, time, 16).reshape(batch * time, 16)
+        shaped = self.body_model.with_shape(betas_expanded)
+
+        # Pose the body
+        posed = shaped.with_pose_decomposed(
+            T_world_root=T_world_root,
+            body_quats=body_quats_flat,
+            left_hand_quats=None,
+            right_hand_quats=None,
+        )
+
+        # Extract requested joint positions
+        if joint_indices is not None:
+            positions_flat = posed.Ts_world_joint[:, joint_indices, 4:7]
+            num_out = len(joint_indices)
+        else:
+            positions_flat = posed.Ts_world_joint[:, :, 4:7]
+            num_out = posed.Ts_world_joint.shape[1]
+
+        return positions_flat.reshape(batch, time, num_out, 3)
+
     def compute_denoising_loss(
         self,
         model: network.EgoDenoiser | DistributedDataParallel | OptimizedModule,
@@ -177,28 +247,55 @@ class TrainingLossComputerWithWrist:
         batch, time, num_joints, _ = train_batch.body_quats.shape
         assert num_joints == 21
         
-        # Extract root translation and orientation from T_world_root
-        root_trans = train_batch.T_world_root[:, :, 4:7]  # Last 3 elements are translation
-        root_orient = SO3(train_batch.T_world_root[:, :, :4]).as_matrix()  # (batch, time, 3, 3)
+        # Extract root translation and orientation from T_world_root (world frame)
+        root_trans_world = train_batch.T_world_root[:, :, 4:7]  # (batch, time, 3)
+        root_orient_world = SO3(train_batch.T_world_root[:, :, :4]).as_matrix()  # (batch, time, 3, 3)
+        
+        gt_body_rotmats = SO3(train_batch.body_quats).as_matrix()
+        gt_betas_expanded = train_batch.betas.expand((batch, time, 16))
+        
+        # ============================================================
+        # Compute right hand transform via FK for coordinate frame change
+        # The condition's right hand defines the new coordinate system.
+        # ============================================================
+        assert self.body_model is not None, "Body model is required for right-hand coordinate frame"
+        gt_wrist_fk = self._compute_wrist_fk(
+            betas=gt_betas_expanded,
+            body_rotmats=gt_body_rotmats,
+            root_trans=root_trans_world,
+            root_orient=root_orient_world,
+        )
+        
+        # Right hand position and orientation in world frame
+        rh_pos_world = gt_wrist_fk['positions'][:, :, 1, :]  # (batch, time, 3)
+        rh_quat_world = gt_wrist_fk['orientations'][:, :, 1, :]  # (batch, time, 4) wxyz
+        
+        # R_world_rh: rotation from right-hand frame to world frame
+        R_world_rh = SO3(rh_quat_world)
+        R_rh_world = R_world_rh.inverse()
+        
+        # Transform root translation and orientation to right hand frame
+        root_trans_rh = R_rh_world @ (root_trans_world - rh_pos_world)  # (batch, time, 3)
+        root_orient_rh = (R_rh_world @ SO3.from_matrix(root_orient_world)).as_matrix()  # (batch, time, 3, 3)
         
         if unwrapped_model.config.include_hands:
             assert train_batch.hand_quats is not None
             x_0 = network.EgoDenoiseTraj(
-                betas=train_batch.betas.expand((batch, time, 16)),
-                body_rotmats=SO3(train_batch.body_quats).as_matrix(),
+                betas=gt_betas_expanded,
+                body_rotmats=gt_body_rotmats,
                 contacts=train_batch.contacts,
                 hand_rotmats=SO3(train_batch.hand_quats).as_matrix(),
-                root_trans=root_trans,
-                root_orient=root_orient,
+                root_trans=root_trans_rh,
+                root_orient=root_orient_rh,
             )
         else:
             x_0 = network.EgoDenoiseTraj(
-                betas=train_batch.betas.expand((batch, time, 16)),
-                body_rotmats=SO3(train_batch.body_quats).as_matrix(),
+                betas=gt_betas_expanded,
+                body_rotmats=gt_body_rotmats,
                 contacts=train_batch.contacts,
                 hand_rotmats=None,
-                root_trans=root_trans,
-                root_orient=root_orient,
+                root_trans=root_trans_rh,
+                root_orient=root_orient_rh,
             )
         x_0_packed = x_0.pack()
         device = x_0_packed.device
@@ -242,30 +339,14 @@ class TrainingLossComputerWithWrist:
             )
 
         # Extract wrist positions+orientations for conditioning (joints 19 and 20)
-        # Use FK to compute both wrist positions and quaternion orientations
+        # Reuse the FK already computed for the coordinate frame change
         wrist_positions: Tensor | None = None
-        gt_wrist_fk: dict | None = None
         if unwrapped_model.config.use_wrist_conditioning:
-            if self.body_model is not None:
-                # Compute GT wrist positions + orientations via FK
-                gt_wrist_fk = self._compute_wrist_fk(
-                    betas=x_0.betas,
-                    body_rotmats=x_0.body_rotmats,
-                    root_trans=x_0.root_trans,
-                    root_orient=x_0.root_orient,
-                )
-                # 14D: [left_pos(3), right_pos(3), left_quat(4), right_quat(4)]
-                wrist_positions = torch.cat([
-                    gt_wrist_fk['positions'].reshape((batch, time, 6)),
-                    gt_wrist_fk['orientations'].reshape((batch, time, 8)),
-                ], dim=-1)  # (batch, time, 14)
-            else:
-                # Fallback: positions from preprocessed data, identity quaternions
-                pos = train_batch.joints_wrt_world[:, :, 19:21, :].reshape((batch, time, 6))
-                identity_quats = torch.zeros((batch, time, 8), device=device)
-                identity_quats[..., 0] = 1.0  # w=1 for left wrist
-                identity_quats[..., 4] = 1.0  # w=1 for right wrist
-                wrist_positions = torch.cat([pos, identity_quats], dim=-1)
+            # 14D: [left_pos(3), right_pos(3), left_quat(4), right_quat(4)] in world frame
+            wrist_positions = torch.cat([
+                gt_wrist_fk['positions'].reshape((batch, time, 6)),
+                gt_wrist_fk['orientations'].reshape((batch, time, 8)),
+            ], dim=-1)  # (batch, time, 14)
 
         # Denoise.
         x_0_packed_pred = model.forward(
@@ -297,9 +378,9 @@ class TrainingLossComputerWithWrist:
             bt_mask_sum: Int[Tensor, ""] = torch.sum(train_batch.mask),
         ) -> Float[Tensor, ""]:
             """Weight and mask per-timestep losses (squared errors)."""
-            _, _, d = loss_per_step.shape
-            assert loss_per_step.shape == (batch, time, d)
-            assert bt_mask.shape == (batch, time)
+            b_local, t_local, _ = loss_per_step.shape
+            assert b_local == batch
+            assert bt_mask.shape == (batch, t_local)
             assert weight_t.shape == (batch,)
             return (
                 # Sum across b axis.
@@ -338,27 +419,23 @@ class TrainingLossComputerWithWrist:
 
         # ============================================================
         # Compute wrist FK error
+        # Transform predicted root from right-hand frame back to world
+        # frame, then run FK to get predicted wrist world positions.
         # ============================================================
         if self.body_model is not None and "wrist_fk" in self.config.loss_weights:
-            # Get GT wrist positions (reuse from conditioning if available)
-            if gt_wrist_fk is not None:
-                gt_wrist_positions = gt_wrist_fk['positions']  # (batch, time, 2, 3)
-            else:
-                gt_wrist_fk = self._compute_wrist_fk(
-                    betas=x_0.betas,
-                    body_rotmats=x_0.body_rotmats,
-                    root_trans=x_0.root_trans,
-                    root_orient=x_0.root_orient,
-                )
-                gt_wrist_positions = gt_wrist_fk['positions']
+            # GT wrist positions are already in world frame (from gt_wrist_fk)
+            gt_wrist_positions = gt_wrist_fk['positions']  # (batch, time, 2, 3)
             
-            # Compute predicted wrist positions using FK
-            # Now uses PREDICTED root_orient (model predicts root orientation!)
+            # Transform predicted root back from right-hand frame to world frame
+            pred_root_trans_world = (R_world_rh @ x_0_pred.root_trans) + rh_pos_world
+            pred_root_orient_world = (R_world_rh @ SO3.from_matrix(x_0_pred.root_orient)).as_matrix()
+            
+            # Compute predicted wrist positions via FK in world frame
             pred_wrist_fk = self._compute_wrist_fk(
                 betas=x_0_pred.betas,
                 body_rotmats=x_0_pred.body_rotmats,
-                root_trans=x_0_pred.root_trans,
-                root_orient=x_0_pred.root_orient,
+                root_trans=pred_root_trans_world,
+                root_orient=pred_root_orient_world,
             )
             pred_wrist_positions = pred_wrist_fk['positions']  # (batch, time, 2, 3)
             
@@ -373,6 +450,35 @@ class TrainingLossComputerWithWrist:
             log_outputs["wrist_fk/right_mse"] = right_wrist_error
         else:
             loss_terms["wrist_fk"] = 0.0
+
+        # ============================================================
+        # Root translation velocity loss (in right-hand frame)
+        # Supervises per-frame displacement so the model learns how
+        # much the body moves each frame relative to the right hand.
+        # ============================================================
+        if "root_vel" in self.config.loss_weights:
+            # Per-frame velocity: (batch, time-1, 3)
+            pred_root_vel = x_0_pred.root_trans[:, 1:, :] - x_0_pred.root_trans[:, :-1, :]
+            gt_root_vel = x_0.root_trans[:, 1:, :] - x_0.root_trans[:, :-1, :]
+
+            root_vel_error = (pred_root_vel - gt_root_vel) ** 2  # (batch, time-1, 3)
+
+            # Mask for velocity: both frames must be valid
+            vel_mask = train_batch.mask[:, 1:] & train_batch.mask[:, :-1]  # (batch, time-1)
+            vel_mask_sum = torch.maximum(
+                torch.sum(vel_mask), torch.tensor(1, device=device)
+            )
+            loss_terms["root_vel"] = weight_and_mask_loss(
+                root_vel_error, bt_mask=vel_mask, bt_mask_sum=vel_mask_sum
+            )
+            log_outputs["root_vel/mean_speed_gt"] = torch.mean(
+                torch.norm(gt_root_vel, dim=-1)
+            )
+            log_outputs["root_vel/mean_speed_pred"] = torch.mean(
+                torch.norm(pred_root_vel, dim=-1)
+            )
+        else:
+            loss_terms["root_vel"] = 0.0
 
         # Include hand objective.
         # We didn't use this in the paper.
