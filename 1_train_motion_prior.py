@@ -7,15 +7,18 @@ from typing import Literal
 
 import tensorboardX
 import wandb
+import torch
 import torch.optim.lr_scheduler
 import torch.utils.data
 import tyro
 import yaml
 from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.utils import ProjectConfiguration
+from ema_pytorch import EMA
 from loguru import logger
+from safetensors.torch import save_file as safetensors_save_file
 
-from egoallo import fncsmpl, network, training_loss_with_wrist, training_utils
+from egoallo import fncsmpl, network, training_loss_no_fk, training_utils
 from egoallo.data.amass import EgoAmassHdf5Dataset
 from egoallo.data.dataclass import collate_dataclass
 
@@ -27,9 +30,9 @@ class EgoAlloTrainConfig:
     dataset_files_path: Path
 
     model: network.EgoDenoiserConfig = network.EgoDenoiserConfig()
-    loss: training_loss_with_wrist.TrainingLossConfigWithWrist = training_loss_with_wrist.TrainingLossConfigWithWrist()
+    loss: training_loss_no_fk.TrainingLossConfigNoFK = training_loss_no_fk.TrainingLossConfigNoFK()
     
-    # SMPL-H model path for FK-based wrist loss
+    # SMPL-H model path for FK-based wrist evaluation (not in training gradient)
     smplh_npz_path: Path = Path("./data/smplh/neutral/model.npz")
 
     # Dataset arguments.
@@ -57,6 +60,11 @@ class EgoAlloTrainConfig:
     weight_decay: float = 1e-4
     warmup_steps: int = 1000
     max_grad_norm: float = 1.0
+
+    # EMA options.
+    use_ema: bool = True
+    ema_decay: float = 0.995
+    ema_update_every: int = 10
 
 
 def get_experiment_dir(experiment_name: str, version: int = 0) -> Path:
@@ -164,9 +172,37 @@ def run_training(
     )
     accelerator.register_for_checkpointing(scheduler)
 
+    # EMA setup (wraps the unwrapped model; ema_pytorch handles warmup,
+    # decay scheduling, and efficient in-place updates).
+    ema: EMA | None = None
+    if config.use_ema:
+        ema = EMA(
+            accelerator.unwrap_model(model),
+            beta=config.ema_decay,
+            update_every=config.ema_update_every,
+            update_after_step=config.warmup_steps,  # don't EMA during LR warmup
+        )
+        ema.to(device)
+        logger.info(
+            f"EMA enabled (ema_pytorch): beta={config.ema_decay}, "
+            f"update_every={config.ema_update_every}, "
+            f"update_after_step={config.warmup_steps}"
+        )
+
     # Restore an existing model checkpoint.
     if restore_checkpoint_dir is not None:
         accelerator.load_state(str(restore_checkpoint_dir))
+        # Restore EMA state if available.
+        if ema is not None:
+            ema_state_path = Path(restore_checkpoint_dir) / "ema_state.pt"
+            if ema_state_path.exists():
+                ema.load_state_dict(torch.load(ema_state_path, map_location=device))
+                logger.info(f"Restored EMA state from {ema_state_path}")
+            else:
+                logger.warning(
+                    "EMA enabled but no ema_state.pt found in checkpoint — "
+                    "starting EMA from current model weights."
+                )
 
     # Get the initial step count.
     if restore_checkpoint_dir is not None and restore_checkpoint_dir.name.startswith(
@@ -182,11 +218,11 @@ def run_training(
     # checkpoint vs the others.
     accelerator.save_state(str(experiment_dir / f"checkpoints_{step}"))
 
-    # Load body model for FK-based wrist loss
+    # Load body model for FK-based wrist evaluation (no FK in training gradient)
     body_model = fncsmpl.SmplhModel.load(config.smplh_npz_path).to(device)
     
     # Run training loop!
-    loss_helper = training_loss_with_wrist.TrainingLossComputerWithWrist(
+    loss_helper = training_loss_no_fk.TrainingLossComputerNoFK(
         config.loss, device=device, body_model=body_model
     )
     loop_metrics_gen = training_utils.loop_metric_generator(counter_init=step)
@@ -210,9 +246,32 @@ def run_training(
             scheduler.step()
             optim.zero_grad(set_to_none=True)
 
+            # Update EMA shadow weights.
+            if ema is not None:
+                ema.update()
+
             # The rest of the loop will only be executed by the main process.
             if not accelerator.is_main_process:
                 continue
+
+            # Periodic FK-based wrist evaluation (no gradient).
+            eval_every = loss_helper.config.eval_wrist_every_n_steps
+            if eval_every > 0 and step % eval_every == 0 and step > 0:
+                eval_metrics = loss_helper.evaluate_wrist_error(
+                    model,
+                    unwrapped_model=accelerator.unwrap_model(model),
+                    train_batch=train_batch,
+                )
+                if writer is not None:
+                    for k, v in eval_metrics.items():
+                        writer.add_scalar(k, v, step)
+                if config.use_wandb:
+                    wandb.log(eval_metrics, step=step)
+                logger.info(
+                    f"step {step}: wrist eval — "
+                    + ", ".join(f"{k}: {v:.4f}" for k, v in eval_metrics.items()
+                                if "mean_l2" in k or "mpjpe" in k)
+                )
 
             # Logging.
             if step % 10 == 0:
@@ -240,6 +299,16 @@ def run_training(
                 checkpoint_path = experiment_dir / f"checkpoints_{step}"
                 accelerator.save_state(str(checkpoint_path))
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
+
+                # Save EMA weights as a standalone safetensors file.
+                if ema is not None:
+                    ema_model_path = checkpoint_path / "ema_model.safetensors"
+                    safetensors_save_file(
+                        ema.ema_model.state_dict(), ema_model_path
+                    )
+                    # Also save full EMA state for resuming training.
+                    torch.save(ema.state_dict(), checkpoint_path / "ema_state.pt")
+                    logger.info(f"Saved EMA weights to {ema_model_path}")
 
                 # Keep checkpoints from only every 100k steps.
                 if prev_checkpoint_path is not None:
