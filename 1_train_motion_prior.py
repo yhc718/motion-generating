@@ -3,6 +3,7 @@
 import dataclasses
 import shutil
 from pathlib import Path
+import sys
 from typing import Literal
 
 import tensorboardX
@@ -18,9 +19,23 @@ from ema_pytorch import EMA
 from loguru import logger
 from safetensors.torch import save_file as safetensors_save_file
 
-from egoallo import fncsmpl, network, training_loss_no_fk, training_utils
+# Force imports to resolve from this repository's `src/` first.
+PROJECT_ROOT = Path(__file__).resolve().parent
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from egoallo import fncsmpl, network, training_loss_with_wrist, training_utils
 from egoallo.data.amass import EgoAmassHdf5Dataset
 from egoallo.data.dataclass import collate_dataclass
+
+# Safety check: fail fast if `egoallo` is imported from somewhere else.
+_egoallo_file = Path(network.__file__).resolve()
+if SRC_DIR not in _egoallo_file.parents:
+    raise RuntimeError(
+        f"Imported egoallo from unexpected path: {_egoallo_file}. "
+        f"Expected under: {SRC_DIR}"
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -30,7 +45,7 @@ class EgoAlloTrainConfig:
     dataset_files_path: Path
 
     model: network.EgoDenoiserConfig = network.EgoDenoiserConfig()
-    loss: training_loss_no_fk.TrainingLossConfigNoFK = training_loss_no_fk.TrainingLossConfigNoFK()
+    loss: training_loss_with_wrist.TrainingLossConfigWithWrist = training_loss_with_wrist.TrainingLossConfigWithWrist()
     
     # SMPL-H model path for FK-based wrist evaluation (not in training gradient)
     smplh_npz_path: Path = Path("./data/smplh/neutral/model.npz")
@@ -139,6 +154,13 @@ def run_training(
 
     # Setup.
     model = network.EgoDenoiser(config.model)
+    if config.model.use_wrist_conditioning:
+        logger.info(
+            "Wrist conditioning enabled: "
+            f"wrist_cond_param={config.model.wrist_cond_param}, "
+            f"raw_dim={config.model.d_wrist_cond_in}, "
+            f"fourier_enc_freqs={config.model.fourier_enc_freqs}"
+        )
     train_loader = torch.utils.data.DataLoader(
         dataset=EgoAmassHdf5Dataset(
             config.dataset_hdf5_path,
@@ -222,7 +244,7 @@ def run_training(
     body_model = fncsmpl.SmplhModel.load(config.smplh_npz_path).to(device)
     
     # Run training loop!
-    loss_helper = training_loss_no_fk.TrainingLossComputerNoFK(
+    loss_helper = training_loss_with_wrist.TrainingLossComputerWithWrist(
         config.loss, device=device, body_model=body_model
     )
     loop_metrics_gen = training_utils.loop_metric_generator(counter_init=step)
@@ -254,6 +276,7 @@ def run_training(
             if not accelerator.is_main_process:
                 continue
 
+            """
             # Periodic FK-based wrist evaluation (no gradient).
             eval_every = loss_helper.config.eval_wrist_every_n_steps
             if eval_every > 0 and step % eval_every == 0 and step > 0:
@@ -272,6 +295,7 @@ def run_training(
                     + ", ".join(f"{k}: {v:.4f}" for k, v in eval_metrics.items()
                                 if "mean_l2" in k or "mpjpe" in k)
                 )
+            """
 
             # Logging.
             if step % 10 == 0:

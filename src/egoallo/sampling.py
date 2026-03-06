@@ -70,7 +70,7 @@ def run_sampling_with_stitching(
     device: torch.device,
     object_sdf_data: dict | None = None,
     guidance_verbose: bool = True,
-    wrist_positions: Float[Tensor, "time 14"] | None = None,
+    wrist_positions: Float[Tensor, "time wrist_cond_dim"] | None = None,
     use_predicted_root: bool = False,
 ) -> network.EgoDenoiseTraj:
     # Offset the T_world_cpf transform to place the floor at z=0 for the

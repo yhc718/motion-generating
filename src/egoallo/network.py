@@ -147,6 +147,17 @@ class EgoDenoiserConfig:
     use_slam_conditioning: bool = False
     use_wrist_conditioning: bool = True
     """Whether to use wrist positions as conditioning instead of CPF poses."""
+    wrist_cond_param: Literal[
+        "absolute", "rh_first", "rh_first_global_z", "absrel", "ours"
+    ] = "absolute"
+    """How wrist conditioning features are parameterized.
+
+    "absolute": world-frame [left_pos, right_pos, left_quat, right_quat].
+    "rh_first": each wrist pose relative to its own pose at first valid frame.
+    "rh_first_global_z": same as rh_first, but z uses global/world height per hand.
+    "absrel": concatenates absolute, rh_first_global_z, and hand communication features.
+    "ours": relative wrist motion deltas + per-hand global heights + absolute hand communication + first-frame-relative base.
+    """
 
     positional_encoding: Literal["transformer", "rope"] = "rope"
     noise_conditioning: Literal["token", "film"] = "token"
@@ -176,6 +187,20 @@ class EgoDenoiserConfig:
     """Whether to include hand positions in the conditioning information."""
 
     @cached_property
+    def d_wrist_cond_in(self) -> int:
+        """Dimensionality of the wrist-conditioning input before Fourier encoding."""
+        if self.wrist_cond_param == "absolute":
+            return 14
+        elif self.wrist_cond_param in ("rh_first", "rh_first_global_z"):
+            return 21
+        elif self.wrist_cond_param == "absrel":
+            return 35
+        elif self.wrist_cond_param == "ours":
+            return 37
+        else:
+            assert_never(self.wrist_cond_param)
+
+    @cached_property
     def d_cond(self) -> int:
         """Dimensionality of conditioning vector."""
 
@@ -183,9 +208,7 @@ class EgoDenoiserConfig:
             return 0
         
         if self.use_wrist_conditioning:
-            # Two wrist positions (left and right, each 3D) + quaternion orientations (each 4D)
-            # Total: 3 + 3 + 4 + 4 = 14
-            d_cond = 14
+            d_cond = self.d_wrist_cond_in
             d_cond = d_cond + d_cond * self.fourier_enc_freqs * 2  # Fourier encoding
             return d_cond
         
@@ -224,7 +247,7 @@ class EgoDenoiserConfig:
         T_cpf_tm1_cpf_t: Float[Tensor, "batch time 7"] | None,
         T_world_cpf: Float[Tensor, "batch time 7"] | None,
         hand_positions_wrt_cpf: Float[Tensor, "batch time 6"] | None,
-        wrist_positions: Float[Tensor, "batch time 14"] | None = None,
+        wrist_positions: Float[Tensor, "batch time wrist_cond_dim"] | None = None,
     ) -> Float[Tensor, "batch time d_cond"] | None:
         """Construct conditioning information from CPF pose or wrist positions."""
 
@@ -233,7 +256,10 @@ class EgoDenoiserConfig:
             if wrist_positions is None:
                 raise ValueError("wrist_positions must be provided when use_wrist_conditioning=True")
             (batch, time, _) = wrist_positions.shape
-            assert wrist_positions.shape == (batch, time, 14)
+            assert wrist_positions.shape == (batch, time, self.d_wrist_cond_in), (
+                f"Expected wrist_positions shape (batch, time, {self.d_wrist_cond_in}) "
+                f"for wrist_cond_param='{self.wrist_cond_param}', got {wrist_positions.shape}"
+            )
             cond = fourier_encode(wrist_positions, freqs=self.fourier_enc_freqs)
             assert cond.shape == (batch, time, self.d_cond)
             return cond
@@ -481,7 +507,7 @@ class EgoDenoiser(nn.Module):
         # Observed hand positions, relative to the CPF.
         hand_positions_wrt_cpf: Float[Tensor, "batch time 6"] | None = None,
         # Wrist positions for conditioning
-        wrist_positions: Float[Tensor, "batch time 14"] | None = None,
+        wrist_positions: Float[Tensor, "batch time wrist_cond_dim"] | None = None,
         # Attention mask for using shorter sequences.
         mask: Bool[Tensor, "batch time"] | None = None,
         # Mask for when to drop out / keep conditioning information.

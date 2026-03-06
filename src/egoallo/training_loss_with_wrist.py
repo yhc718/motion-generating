@@ -231,6 +231,315 @@ class TrainingLossComputerWithWrist:
 
         return positions_flat.reshape(batch, time, num_out, 3)
 
+    @staticmethod
+    def _get_first_valid_indices(mask: Bool[Tensor, "batch time"]) -> Int[Tensor, "batch"]:
+        """Get first valid timestep per sequence, fallback to 0 if all masked."""
+        first_valid = mask.to(torch.int64).argmax(dim=1)
+        has_valid = mask.any(dim=1)
+        zeros = torch.zeros_like(first_valid)
+        return torch.where(has_valid, first_valid, zeros)
+
+    @staticmethod
+    def _build_wrist_cond_absolute(
+        wrist_positions_world: Float[Tensor, "batch time 2 3"],
+        wrist_orientations_world: Float[Tensor, "batch time 2 4"],
+    ) -> Float[Tensor, "batch time 14"]:
+        batch, time, _, _ = wrist_positions_world.shape
+        return torch.cat(
+            [
+                wrist_positions_world.reshape(batch, time, 6),
+                wrist_orientations_world.reshape(batch, time, 8),
+            ],
+            dim=-1,
+        )
+
+    def _build_wrist_cond_rh_first_base(
+        self,
+        wrist_positions_world: Float[Tensor, "batch time 2 3"],
+        wrist_orientations_world: Float[Tensor, "batch time 2 4"],
+        mask: Bool[Tensor, "batch time"],
+        keep_global_z: bool,
+    ) -> Float[Tensor, "batch time 14"]:
+        """Build per-hand first-frame wrist conditioning (without hand communication)."""
+        batch, time, _, _ = wrist_positions_world.shape
+
+        first_idx = self._get_first_valid_indices(mask)
+        batch_idx = torch.arange(batch, device=wrist_positions_world.device)
+
+        lh0_pos_world = wrist_positions_world[batch_idx, first_idx, 0, :]  # (b, 3)
+        lh0_quat_world = wrist_orientations_world[batch_idx, first_idx, 0, :]  # (b, 4)
+        rh0_pos_world = wrist_positions_world[batch_idx, first_idx, 1, :]  # (b, 3)
+        rh0_quat_world = wrist_orientations_world[batch_idx, first_idx, 1, :]  # (b, 4)
+
+        lh0_pos_world_flat = lh0_pos_world[:, None, :].expand(-1, time, -1).reshape(batch * time, 3)
+        rh0_pos_world_flat = rh0_pos_world[:, None, :].expand(-1, time, -1).reshape(batch * time, 3)
+        lh0_quat_world_flat = lh0_quat_world[:, None, :].expand(-1, time, -1).reshape(batch * time, 4)
+        rh0_quat_world_flat = rh0_quat_world[:, None, :].expand(-1, time, -1).reshape(batch * time, 4)
+
+        lh_pos_world_flat = wrist_positions_world[:, :, 0, :].reshape(batch * time, 3)
+        rh_pos_world_flat = wrist_positions_world[:, :, 1, :].reshape(batch * time, 3)
+        lh_ori_world_flat = wrist_orientations_world[:, :, 0, :].reshape(batch * time, 4)
+        rh_ori_world_flat = wrist_orientations_world[:, :, 1, :].reshape(batch * time, 4)
+
+        lh_pos_rel = (SO3(lh0_quat_world_flat).inverse() @ (lh_pos_world_flat - lh0_pos_world_flat)).reshape(
+            batch, time, 3
+        )
+        rh_pos_rel = (SO3(rh0_quat_world_flat).inverse() @ (rh_pos_world_flat - rh0_pos_world_flat)).reshape(
+            batch, time, 3
+        )
+
+        lh_ori_rel = (SO3(lh0_quat_world_flat).inverse() @ SO3(lh_ori_world_flat)).wxyz.reshape(
+            batch, time, 4
+        )
+        rh_ori_rel = (SO3(rh0_quat_world_flat).inverse() @ SO3(rh_ori_world_flat)).wxyz.reshape(
+            batch, time, 4
+        )
+
+        if keep_global_z:
+            lh_pos_rel = torch.cat(
+                [lh_pos_rel[..., :2], wrist_positions_world[:, :, 0, 2:3]],
+                dim=-1,
+            )
+            rh_pos_rel = torch.cat(
+                [rh_pos_rel[..., :2], wrist_positions_world[:, :, 1, 2:3]],
+                dim=-1,
+            )
+
+        pos_rel = torch.stack([lh_pos_rel, rh_pos_rel], dim=2)
+        ori_rel = torch.stack([lh_ori_rel, rh_ori_rel], dim=2)
+
+        base = torch.cat(
+            [
+                pos_rel.reshape(batch, time, 6),
+                ori_rel.reshape(batch, time, 8),
+            ],
+            dim=-1,
+        )
+        return base
+
+    def _build_wrist_cond_rh_first(
+        self,
+        wrist_positions_world: Float[Tensor, "batch time 2 3"],
+        wrist_orientations_world: Float[Tensor, "batch time 2 4"],
+        mask: Bool[Tensor, "batch time"],
+        keep_global_z: bool,
+    ) -> Float[Tensor, "batch time 21"]:
+        """Build wrist conditioning in each hand's first-frame coordinates, plus hand comm."""
+        base = self._build_wrist_cond_rh_first_base(
+            wrist_positions_world=wrist_positions_world,
+            wrist_orientations_world=wrist_orientations_world,
+            mask=mask,
+            keep_global_z=keep_global_z,
+        )
+        hand_comm = self._build_wrist_cond_hand_comm(
+            wrist_positions_world=wrist_positions_world,
+            wrist_orientations_world=wrist_orientations_world,
+        )
+        return torch.cat([base, hand_comm], dim=-1)
+
+    @staticmethod
+    def _build_wrist_cond_hand_comm(
+        wrist_positions_world: Float[Tensor, "batch time 2 3"],
+        wrist_orientations_world: Float[Tensor, "batch time 2 4"],
+    ) -> Float[Tensor, "batch time 7"]:
+        """Left-right communication in left frame: [rel_pos(3), rel_ori(4)]."""
+        batch, time, _, _ = wrist_positions_world.shape
+        lr_pos_world = wrist_positions_world[:, :, 1, :] - wrist_positions_world[:, :, 0, :]
+        lr_pos_world = lr_pos_world.reshape(batch * time, 3)
+        lh_quat_world = wrist_orientations_world[:, :, 0, :].reshape(batch * time, 4)
+        rh_quat_world = wrist_orientations_world[:, :, 1, :].reshape(batch * time, 4)
+
+        lr_pos_left = (SO3(lh_quat_world).inverse() @ lr_pos_world).reshape(batch, time, 3)
+        lr_ori_left = (
+            SO3(lh_quat_world).inverse() @ SO3(rh_quat_world)
+        ).wxyz.reshape(batch, time, 4)
+        return torch.cat([lr_pos_left, lr_ori_left], dim=-1)
+
+    @staticmethod
+    def _build_wrist_cond_hand_comm_deltas(
+        wrist_positions_world: Float[Tensor, "batch time 2 3"],
+        wrist_orientations_world: Float[Tensor, "batch time 2 4"],
+    ) -> Float[Tensor, "batch time 7"]:
+        """Left-right communication per-frame delta in previous LR frame."""
+        batch, time, _, _ = wrist_positions_world.shape
+        comm_deltas = torch.zeros((batch, time, 7), device=wrist_positions_world.device, dtype=wrist_positions_world.dtype)
+
+        lr_pos_world = wrist_positions_world[:, :, 1, :] - wrist_positions_world[:, :, 0, :]
+        lh_quat_world = wrist_orientations_world[:, :, 0, :].reshape(batch * time, 4)
+        rh_quat_world = wrist_orientations_world[:, :, 1, :].reshape(batch * time, 4)
+        lr_ori = (SO3(lh_quat_world).inverse() @ SO3(rh_quat_world)).wxyz.reshape(
+            batch, time, 4
+        )
+        lr_pos_left = (SO3(lh_quat_world).inverse() @ lr_pos_world.reshape(
+            batch * time, 3
+        )).reshape(batch, time, 3)
+
+        if time > 1:
+            lr_pos_delta_world = lr_pos_left[:, 1:, :] - lr_pos_left[:, :-1, :]
+            lr_ori_prev = SO3(lr_ori[:, :-1, :].reshape((batch * (time - 1), 4)))
+            lr_pos_delta_flat = lr_pos_delta_world.reshape((batch * (time - 1), 3))
+            comm_deltas[:, 1:, :3] = (
+                lr_ori_prev.inverse() @ lr_pos_delta_flat
+            ).reshape((batch, time - 1, 3))
+
+            lr_ori_next_flat = SO3(lr_ori[:, 1:, :].reshape((batch * (time - 1), 4)))
+            comm_deltas[:, 1:, 3:] = (lr_ori_prev.inverse() @ lr_ori_next_flat).wxyz.reshape(
+                (batch, time - 1, 4)
+            )
+
+        return comm_deltas
+
+    def _build_wrist_cond_ours(
+        self,
+        wrist_positions_world: Float[Tensor, "batch time 2 3"],
+        wrist_orientations_world: Float[Tensor, "batch time 2 4"],
+        mask: Bool[Tensor, "batch time"],
+    ) -> Float[Tensor, "batch time 37"]:
+        """Relative wrist deltas + global-z + absolute hand comm + first-frame-relative base.
+
+        Inspired by the original cond_param 'ours' which combines:
+          - frame-to-frame deltas  (local motion)
+          - global height          (absolute vertical reference)
+          - canonicalized rotation (absolute orientation context)
+
+        Here we analogously combine:
+          - per-hand frame-to-frame pos/ori deltas  (local motion, 14D)
+          - per-hand global z height                 (absolute vertical, 2D)
+          - absolute hand communication              (inter-hand spatial, 7D)
+          - first-frame-relative pos+ori per hand    (absolute context, 14D)
+
+        Layout: [pos_deltas(6), ori_deltas(8), global_z(2), hand_comm(7), rh_first_base(14)]
+        """
+        batch, time, _, _ = wrist_positions_world.shape
+
+        pos_deltas = torch.zeros_like(wrist_positions_world)
+        ori_deltas = torch.zeros_like(wrist_orientations_world)
+        ori_deltas[..., 0] = 1.0  # identity quaternion for t=0
+
+        if time > 1:
+            # Mask-aware deltas: only compute where both current and previous
+            # frames are valid.  Invalid positions are zeroed (pos) or set to
+            # identity quaternion (ori) so they don't leak garbage into the
+            # conditioning signal that other timesteps attend to.
+            delta_mask = mask[:, 1:] & mask[:, :-1]  # (batch, time-1)
+            delta_mask_expand = delta_mask.unsqueeze(-1)  # (batch, time-1, 1)
+
+            for hand_idx in range(2):
+                # Translation deltas projected into previous frame.
+                pos_delta_world = (
+                    wrist_positions_world[:, 1:, hand_idx, :]
+                    - wrist_positions_world[:, :-1, hand_idx, :]
+                )
+                prev_quat = wrist_orientations_world[:, :-1, hand_idx, :]
+                prev = SO3(prev_quat.reshape((batch * (time - 1), 4)))
+                pos_delta_rel = (
+                    prev.inverse() @ pos_delta_world.reshape((batch * (time - 1), 3))
+                ).reshape((batch, time - 1, 3))
+                pos_deltas[:, 1:, hand_idx, :] = pos_delta_rel * delta_mask_expand
+
+                # Orientation deltas.
+                ori_prev = SO3(
+                    wrist_orientations_world[:, :-1, hand_idx, :].reshape(
+                        (batch * (time - 1), 4)
+                    )
+                )
+                ori_next = SO3(
+                    wrist_orientations_world[:, 1:, hand_idx, :].reshape(
+                        (batch * (time - 1), 4)
+                    )
+                )
+                ori_delta = (ori_prev.inverse() @ ori_next).wxyz.reshape(
+                    (batch, time - 1, 4)
+                )
+                identity_q = torch.zeros_like(ori_delta)
+                identity_q[..., 0] = 1.0
+                ori_deltas[:, 1:, hand_idx, :] = torch.where(
+                    delta_mask_expand.expand_as(ori_delta), ori_delta, identity_q
+                )
+
+        # Per-hand global z height (absolute vertical reference).
+        global_z = wrist_positions_world[:, :, :, 2:3].reshape(batch, time, 2)
+
+        # Absolute hand communication (inter-hand relationship each frame).
+        hand_comm = self._build_wrist_cond_hand_comm(
+            wrist_positions_world=wrist_positions_world,
+            wrist_orientations_world=wrist_orientations_world,
+        )
+
+        # First-frame-relative positions + orientations per hand.
+        # This provides the model with absolute spatial context (analogous to
+        # the canonicalized rotation in the original cond_param 'ours'),
+        # ensuring that even at t=0 the model knows where each hand is.
+        rh_first_base = self._build_wrist_cond_rh_first_base(
+            wrist_positions_world=wrist_positions_world,
+            wrist_orientations_world=wrist_orientations_world,
+            mask=mask,
+            keep_global_z=True,
+        )
+
+        out = torch.cat(
+            [
+                pos_deltas.reshape(batch, time, 6),
+                ori_deltas.reshape(batch, time, 8),
+                global_z,
+                hand_comm,
+                rh_first_base,
+            ],
+            dim=-1,
+        )
+        assert out.shape == (batch, time, 37), f"ours wrist conditioning expected (batch,time,37), got {out.shape}"
+        return out
+
+    def _build_wrist_conditioning(
+        self,
+        wrist_positions_world: Float[Tensor, "batch time 2 3"],
+        wrist_orientations_world: Float[Tensor, "batch time 2 4"],
+        mask: Bool[Tensor, "batch time"],
+        wrist_cond_param: str,
+    ) -> Float[Tensor, "batch time wrist_cond_dim"]:
+        """Build wrist conditioning features according to model config."""
+        absolute = self._build_wrist_cond_absolute(
+            wrist_positions_world=wrist_positions_world,
+            wrist_orientations_world=wrist_orientations_world,
+        )
+
+        if wrist_cond_param == "absolute":
+            return absolute
+        elif wrist_cond_param == "rh_first":
+            return self._build_wrist_cond_rh_first(
+                wrist_positions_world=wrist_positions_world,
+                wrist_orientations_world=wrist_orientations_world,
+                mask=mask,
+                keep_global_z=False,
+            )
+        elif wrist_cond_param == "rh_first_global_z":
+            return self._build_wrist_cond_rh_first(
+                wrist_positions_world=wrist_positions_world,
+                wrist_orientations_world=wrist_orientations_world,
+                mask=mask,
+                keep_global_z=True,
+            )
+        elif wrist_cond_param == "absrel":
+            rel = self._build_wrist_cond_rh_first_base(
+                wrist_positions_world=wrist_positions_world,
+                wrist_orientations_world=wrist_orientations_world,
+                mask=mask,
+                keep_global_z=True,
+            )
+            hand_comm = self._build_wrist_cond_hand_comm(
+                wrist_positions_world=wrist_positions_world,
+                wrist_orientations_world=wrist_orientations_world,
+            )
+            return torch.cat([absolute, rel, hand_comm], dim=-1)
+        elif wrist_cond_param == "ours":
+            return self._build_wrist_cond_ours(
+                wrist_positions_world=wrist_positions_world,
+                wrist_orientations_world=wrist_orientations_world,
+                mask=mask,
+            )
+        else:
+            raise ValueError(f"Unknown wrist_cond_param: {wrist_cond_param}")
+
     def compute_denoising_loss(
         self,
         model: network.EgoDenoiser | DistributedDataParallel | OptimizedModule,
@@ -338,15 +647,15 @@ class TrainingLossComputerWithWrist:
                 0.0,
             )
 
-        # Extract wrist positions+orientations for conditioning (joints 19 and 20)
-        # Reuse the FK already computed for the coordinate frame change
+        # Build wrist conditioning features according to model config.
         wrist_positions: Tensor | None = None
         if unwrapped_model.config.use_wrist_conditioning:
-            # 14D: [left_pos(3), right_pos(3), left_quat(4), right_quat(4)] in world frame
-            wrist_positions = torch.cat([
-                gt_wrist_fk['positions'].reshape((batch, time, 6)),
-                gt_wrist_fk['orientations'].reshape((batch, time, 8)),
-            ], dim=-1)  # (batch, time, 14)
+            wrist_positions = self._build_wrist_conditioning(
+                wrist_positions_world=gt_wrist_fk["positions"],
+                wrist_orientations_world=gt_wrist_fk["orientations"],
+                mask=train_batch.mask,
+                wrist_cond_param=unwrapped_model.config.wrist_cond_param,
+            )
 
         # Denoise.
         x_0_packed_pred = model.forward(
